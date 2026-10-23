@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>PeerFlow WebRTC Engine</title>
+  <script src="peerjs.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0B111E;
+      color: #E2E8F0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      overflow: hidden;
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    #videoContainer {
+      position: relative;
+      flex: 1;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      display: none;
+    }
+    #remoteVideo {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      background: #0F172A;
+    }
+    #localVideo {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      width: 100px;
+      height: 140px;
+      border-radius: 12px;
+      object-fit: cover;
+      border: 2px solid #38BDF8;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+      background: #1E293B;
+      z-index: 10;
+      transform: scaleX(-1);
+    }
+    #statusOverlay {
+      position: absolute;
+      bottom: 24px;
+      left: 16px;
+      right: 16px;
+      text-align: center;
+      padding: 8px 16px;
+      background: rgba(15, 23, 42, 0.75);
+      border-radius: 20px;
+      font-size: 13px;
+      backdrop-filter: blur(4px);
+      z-index: 5;
+    }
+  </style>
+</head>
+<body>
+  <div id="videoContainer">
+    <video id="remoteVideo" autoplay playsinline></video>
+    <video id="localVideo" autoplay playsinline muted></video>
+    <div id="statusOverlay">P2P Media Stream Connected</div>
+  </div>
+
+  <script>
+    (function() {
+      // Global State
+      let peer = null;
+      let activeConnections = {}; // peerId -> DataConnection
+      let currentCall = null;
+      let localStream = null;
+      let currentFacingMode = 'user';
+      let pingIntervals = {};
+      let receivedFileBuffers = {}; // transferId -> { meta, chunks: [], receivedCount, totalChunks }
+
+      // Safe Bridge Notifier
+      function notifyAndroid(type, payload) {
+        try {
+          if (window.AndroidBridge && typeof window.AndroidBridge.onEngineEvent === 'function') {
+            window.AndroidBridge.onEngineEvent(type, JSON.stringify(payload || {}));
+          }
+        } catch (e) {
+          console.error('[EngineBridge] Notify error:', e);
+        }
+      }
+
+      // WebRTC Engine API
+      window.peerEngine = {
+        initPeer: function(customId, configJson, iceServersJson) {
+          try {
+            if (peer) {
+              try { peer.destroy(); } catch(e) {}
+            }
+            activeConnections = {};
+            currentCall = null;
+
+            const config = configJson ? JSON.parse(configJson) : {};
+            const iceServers = iceServersJson ? JSON.parse(iceServersJson) : [
+              { urls: 'stun:stun.l.google.com:19302' },
+              { urls: 'stun:global.stun.twilio.com:3478' }
+            ];
+
+            const peerOptions = {
+              debug: 2,
+              config: {
+                iceServers: iceServers,
+                sdpSemantics: 'unified-plan'
+              }
+            };
+
+            if (config.host && config.host.trim() !== '') {
+              peerOptions.host = config.host;
+              peerOptions.port = config.port || 443;
+              peerOptions.path = config.path || '/';
+              peerOptions.secure = config.secure !== false;
+              if (config.key) peerOptions.key = config.key;
+            }
+
+            peer = customId && customId.trim() !== '' ? new Peer(customId.trim(), peerOptions) : new Peer(peerOptions);
+
+            peer.on('open', function(id) {
+              console.log('[PeerJS] Open with ID:', id);
+              notifyAndroid('PEER_OPEN', { peerId: id });
+            });
+
+            peer.on('connection', function(conn) {
+              console.log('[PeerJS] Incoming connection from:', conn.peer);
+              setupConnectionListeners(conn);
+            });
+
+            peer.on('call', function(call) {
+              console.log('[PeerJS] Incoming call from:', call.peer);
+              currentCall = call;
+              setupCallListeners(call);
+              const isVideo = (call.metadata && call.metadata.isVideo) !== false;
+              notifyAndroid('CALL_INCOMING', { callerId: call.peer, isVideo: isVideo });
+            });
+
+            peer.on('disconnected', function() {
+              console.log('[PeerJS] Disconnected from server');
+              notifyAndroid('PEER_DISCONNECTED', {});
+            });
+
+            peer.on('close', function() {
+              console.log('[PeerJS] Peer destroyed');
+              notifyAndroid('PEER_CLOSE', {});
+            });
+
+            peer.on('error', function(err) {
+              console.error('[PeerJS] Error:', err);
+              notifyAndroid('PEER_ERROR', {
+                type: err.type || 'unknown',
+                message: err.message || String(err)
+              });
+            });
+
+          } catch (err) {
+            console.error('[PeerJS] Init Exception:', err);
+            notifyAndroid('PEER_ERROR', { type: 'initialization_error', message: err.message });
+          }
+        },
+
+        connectToPeer: function(targetPeerId, metadataJson) {
+          if (!peer) return;
+          try {
+            const meta = metadataJson ? JSON.parse(metadataJson) : {};
+            const conn = peer.connect(targetPeerId, {
+              reliable: true,
+              serialization: 'json',
+              metadata: meta
+            });
+            setupConnectionListeners(conn);
+          } catch (e) {
+            console.error('[PeerJS] Connect error:', e);
+            notifyAndroid('CONN_ERROR', { peerId: targetPeerId, error: e.message });
+          }
+        },
+
+        disconnectFromPeer: function(peerId) {
+          if (activeConnections[peerId]) {
+            try {
+              activeConnections[peerId].close();
+            } catch (e) {}
+            delete activeConnections[peerId];
+          }
+        },
+
+        sendChatMessage: function(targetId, msgJson) {
+          const conn = activeConnections[targetId];
+          if (!conn || !conn.open) {
+            notifyAndroid('CONN_ERROR', { peerId: targetId, error: 'Connection not open' });
+            return;
+          }
+          try {
+            const msg = typeof msgJson === 'string' ? JSON.parse(msgJson) : msgJson;
+            const payload = {
+              type: 'CHAT_MESSAGE',
+              id: msg.id,
+              text: msg.text,
+              timestamp: msg.timestamp || Date.now(),
+              replyToId: msg.replyToId || null
+            };
+            conn.send(payload);
+          } catch (e) {
+            console.error('[PeerJS] sendChatMessage error:', e);
+          }
+        },
+
+        sendCryptoHandshake: function(targetId, handshakeType, publicKey, fingerprint) {
+          const conn = activeConnections[targetId];
+          if (conn && conn.open) {
+            conn.send({
+              type: handshakeType, // 'CRYPTO_HANDSHAKE_INIT' or 'CRYPTO_HANDSHAKE_ACK'
+              publicKey: publicKey,
+              fingerprint: fingerprint,
+              timestamp: Date.now()
+            });
+          }
+        },
+
+        sendEncryptedMessage: function(targetId, msgJson) {
+          const conn = activeConnections[targetId];
+          if (!conn || !conn.open) {
+            notifyAndroid('CONN_ERROR', { peerId: targetId, error: 'Connection not open' });
+            return;
+          }
+          try {
+            const msg = typeof msgJson === 'string' ? JSON.parse(msgJson) : msgJson;
+            conn.send({
+              type: 'ENCRYPTED_MESSAGE',
+              id: msg.id,
+              iv: msg.iv,
+              ciphertext: msg.ciphertext,
+              timestamp: msg.timestamp || Date.now(),
+              replyToId: msg.replyToId || null,
+              isRoomBroadcast: !!msg.isRoomBroadcast,
+              roomId: msg.roomId || null
+            });
+          } catch (e) {
+            console.error('[PeerJS] sendEncryptedMessage error:', e);
+          }
+        },
+
+        sendTyping: function(targetId, isTyping) {
+          const conn = activeConnections[targetId];
+          if (conn && conn.open) {
+            conn.send({ type: 'TYPING_STATUS', isTyping: !!isTyping });
+          }
+        },
+
+        sendReaction: function(targetId, messageId, emoji) {
+          const conn = activeConnections[targetId];
+          if (conn && conn.open) {
+            conn.send({ type: 'MESSAGE_REACTION', messageId: messageId, emoji: emoji });
+          }
+        },
+
+        sendReadReceipt: function(targetId, messageId) {
+          const conn = activeConnections[targetId];
+          if (conn && conn.open) {
+            conn.send({ type: 'READ_RECEIPT', messageId: messageId, timestamp: Date.now() });
+          }
+        },
+
+        sendVoiceNote: function(targetId, id, base64Audio, durationMs) {
+          const conn = activeConnections[targetId];
+          if (conn && conn.open) {
+            conn.send({
+              type: 'VOICE_NOTE',
+              id: id,
+              base64Audio: base64Audio,
+              durationMs: durationMs,
+              timestamp: Date.now()
+            });
+          }
+        },
+
+        // File Transfer Protocol
+        startFileOffer: function(targetId, fileMetaJson) {
+          const conn = activeConnections[targetId];
+          if (!conn || !conn.open) {
+            notifyAndroid('CONN_ERROR', { peerId: targetId, error: 'Connection not open' });
+            return;
+          }
+          try {
+            const meta = typeof fileMetaJson === 'string' ? JSON.parse(fileMetaJson) : fileMetaJson;
+            conn.send({
+              type: 'FILE_OFFER',
+              transferId: meta.transferId,
+              fileName: meta.fileName,
+              fileSize: meta.fileSize,
+              mimeType: meta.mimeType,
+              totalChunks: meta.totalChunks,
+              sha256: meta.sha256 || ''
+            });
+          } catch (e) {
+            console.error('startFileOffer error', e);
+          }
+        },
+
+        acceptFileTransfer: function(targetId, transferId) {
+          const conn = activeConnections[targetId];
+          if (conn && conn.open) {
+            conn.send({ type: 'FILE_ACCEPT', transferId: transferId });
+          }
+        },
+
+        declineFileTransfer: function(targetId, transferId, reason) {
+          const conn = activeConnections[targetId];
+          if (conn && conn.open) {
+            conn.send({ type: 'FILE_DECLINE', transferId: transferId, reason: reason || 'Declined' });
+          }
+        },
+
+        sendFileChunk: function(targetId, transferId, chunkIndex, totalChunks, base64Data) {
+          const conn = activeConnections[targetId];
+          if (!conn || !conn.open) return;
+          try {
+            // Respect SCTP DataChannel buffering
+            const dc = conn.dataChannel;
+            if (dc && dc.bufferedAmount > 262144) { // 256KB backpressure
+              setTimeout(() => {
+                conn.send({
+                  type: 'FILE_CHUNK',
+                  transferId: transferId,
+                  chunkIndex: chunkIndex,
+                  totalChunks: totalChunks,
+                  data: base64Data
+                });
+              }, 50);
+            } else {
+              conn.send({
+                type: 'FILE_CHUNK',
+                transferId: transferId,
+                chunkIndex: chunkIndex,
+                totalChunks: totalChunks,
+                data: base64Data
+              });
+            }
+          } catch (e) {
+            console.error('sendFileChunk error', e);
+          }
+        },
+
+        completeFileTransfer: function(targetId, transferId) {
+          const conn = activeConnections[targetId];
+          if (conn && conn.open) {
+            conn.send({ type: 'FILE_COMPLETE', transferId: transferId });
+          }
+        },
+
+        // Audio/Video Calling
+        startCall: function(targetId, isVideo) {
+          if (!peer) return;
+          const constraints = {
+            audio: true,
+            video: isVideo ? { facingMode: currentFacingMode, width: { ideal: 1280 }, height: { ideal: 720 } } : false
+          };
+
+          navigator.mediaDevices.getUserMedia(constraints)
+            .then(function(stream) {
+              localStream = stream;
+              showVideoContainer(isVideo);
+              const localVideo = document.getElementById('localVideo');
+              localVideo.srcObject = stream;
+
+              const call = peer.call(targetId, stream, {
+                metadata: { isVideo: !!isVideo }
+              });
+              currentCall = call;
+              setupCallListeners(call);
+            })
+            .catch(function(err) {
+              console.error('getUserMedia error:', err);
+              notifyAndroid('CALL_ERROR', { error: 'Media permission denied: ' + err.message });
+            });
+        },
+
+        answerCall: function(isVideo) {
+          if (!currentCall) return;
+          const constraints = {
+            audio: true,
+            video: isVideo ? { facingMode: currentFacingMode, width: { ideal: 1280 }, height: { ideal: 720 } } : false
+          };
+
+          navigator.mediaDevices.getUserMedia(constraints)
+            .then(function(stream) {
+              localStream = stream;
+              showVideoContainer(isVideo);
+              const localVideo = document.getElementById('localVideo');
+              localVideo.srcObject = stream;
+
+              currentCall.answer(stream);
+            })
+            .catch(function(err) {
+              console.error('getUserMedia answer error:', err);
+              notifyAndroid('CALL_ERROR', { error: 'Media permission denied: ' + err.message });
+            });
+        },
+
+        endCall: function() {
+          if (currentCall) {
+            try { currentCall.close(); } catch(e) {}
+            currentCall = null;
+          }
+          if (localStream) {
+            try {
+              localStream.getTracks().forEach(track => track.stop());
+            } catch(e) {}
+            localStream = null;
+          }
+          hideVideoContainer();
+          notifyAndroid('CALL_ENDED', { reason: 'User terminated' });
+        },
+
+        toggleAudio: function(enabled) {
+          if (localStream) {
+            localStream.getAudioTracks().forEach(track => {
+              track.enabled = !!enabled;
+            });
+          }
+        },
+
+        toggleVideo: function(enabled) {
+          if (localStream) {
+            localStream.getVideoTracks().forEach(track => {
+              track.enabled = !!enabled;
+            });
+          }
+        },
+
+        switchCamera: function() {
+          if (!localStream) return;
+          currentFacingMode = currentFacingMode === 'user' ? 'environment' : 'user';
+          const videoTrack = localStream.getVideoTracks()[0];
+          if (!videoTrack) return;
+
+          navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: { facingMode: currentFacingMode, width: { ideal: 1280 }, height: { ideal: 720 } }
+          }).then(newStream => {
+            const newTrack = newStream.getVideoTracks()[0];
+            if (currentCall && currentCall.peerConnection) {
+              const sender = currentCall.peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
+              if (sender) {
+                sender.replaceTrack(newTrack);
+              }
+            }
+            localStream.removeTrack(videoTrack);
+            videoTrack.stop();
+            localStream.addTrack(newTrack);
+            document.getElementById('localVideo').srcObject = localStream;
+          }).catch(err => {
+            console.error('switchCamera error', err);
+          });
+        },
+
+        // Telemetry Ping
+        measurePing: function(targetId) {
+          const conn = activeConnections[targetId];
+          if (conn && conn.open) {
+            conn.send({ type: 'PING', sendTime: Date.now() });
+          }
+        },
+
+        // Broadcast to Mesh Room
+        broadcastRoomMessage: function(peerListJson, messageJson) {
+          try {
+            const peers = JSON.parse(peerListJson || '[]');
+            const msg = typeof messageJson === 'string' ? JSON.parse(messageJson) : messageJson;
+            peers.forEach(peerId => {
+              const conn = activeConnections[peerId];
+              if (conn && conn.open) {
+                conn.send({
+                  type: 'CHAT_MESSAGE',
+                  id: msg.id,
+                  text: msg.text,
+                  timestamp: msg.timestamp || Date.now(),
+                  replyToId: msg.replyToId || null,
+                  isRoomBroadcast: true,
+                  roomId: msg.roomId
+                });
+              }
+            });
+          } catch(e) {
+            console.error('broadcastRoomMessage error', e);
+          }
+        },
+
+        reconnect: function() {
+          if (peer && !peer.destroyed) {
+            peer.reconnect();
+          }
+        },
+
+        destroyPeer: function() {
+          if (peer) {
+            try { peer.destroy(); } catch(e) {}
+            peer = null;
+          }
+        }
+      };
+
+      // Helper: Setup DataConnection Listeners
+      function setupConnectionListeners(conn) {
+        conn.on('open', function() {
+          console.log('[PeerJS] DataConnection opened with:', conn.peer);
+          activeConnections[conn.peer] = conn;
+          notifyAndroid('CONN_OPEN', { peerId: conn.peer, metadata: conn.metadata || {} });
+
+          // Start periodic RTT ping
+          startPing(conn.peer);
+
+          // Monitor ICE connection state
+          if (conn.peerConnection) {
+            conn.peerConnection.oniceconnectionstatechange = function() {
+              const state = conn.peerConnection.iceConnectionState;
+              notifyAndroid('ICE_STATE_CHANGE', { peerId: conn.peer, state: state });
+            };
+          }
+        });
+
+        conn.on('data', function(data) {
+          handleIncomingData(conn.peer, data);
+        });
+
+        conn.on('close', function() {
+          console.log('[PeerJS] Connection closed with:', conn.peer);
+          stopPing(conn.peer);
+          delete activeConnections[conn.peer];
+          notifyAndroid('CONN_CLOSE', { peerId: conn.peer });
+        });
+
+        conn.on('error', function(err) {
+          console.error('[PeerJS] Connection error with:', conn.peer, err);
+          notifyAndroid('CONN_ERROR', { peerId: conn.peer, error: err.message || String(err) });
+        });
+      }
+
+      // Helper: Setup MediaConnection (Call) Listeners
+      function setupCallListeners(call) {
+        call.on('stream', function(remoteStream) {
+          console.log('[PeerJS] Received remote stream from:', call.peer);
+          const remoteVideo = document.getElementById('remoteVideo');
+          remoteVideo.srcObject = remoteStream;
+          showVideoContainer(true);
+          notifyAndroid('CALL_CONNECTED', { remoteId: call.peer });
+        });
+
+        call.on('close', function() {
+          console.log('[PeerJS] Call closed with:', call.peer);
+          window.peerEngine.endCall();
+        });
+
+        call.on('error', function(err) {
+          console.error('[PeerJS] Call error with:', call.peer, err);
+          notifyAndroid('CALL_ERROR', { error: err.message || String(err) });
+          window.peerEngine.endCall();
+        });
+      }
+
+      // Helper: Dispatch incoming data packets
+      function handleIncomingData(senderId, data) {
+        if (!data || typeof data !== 'object') return;
+
+        switch (data.type) {
+          case 'CHAT_MESSAGE':
+            // Send automatic delivery ACK
+            sendDeliveryAck(senderId, data.id);
+            notifyAndroid('CHAT_MESSAGE', {
+              senderId: senderId,
+              id: data.id,
+              text: data.text,
+              timestamp: data.timestamp,
+              replyToId: data.replyToId,
+              isRoomBroadcast: !!data.isRoomBroadcast,
+              roomId: data.roomId || null
+            });
+            break;
+
+          case 'CRYPTO_HANDSHAKE_INIT':
+            notifyAndroid('CRYPTO_HANDSHAKE_INIT', {
+              senderId: senderId,
+              publicKey: data.publicKey,
+              fingerprint: data.fingerprint,
+              timestamp: data.timestamp
+            });
+            break;
+
+          case 'CRYPTO_HANDSHAKE_ACK':
+            notifyAndroid('CRYPTO_HANDSHAKE_ACK', {
+              senderId: senderId,
+              publicKey: data.publicKey,
+              fingerprint: data.fingerprint,
+              timestamp: data.timestamp
+            });
+            break;
+
+          case 'ENCRYPTED_MESSAGE':
+            // Send delivery ACK for encrypted payload
+            sendDeliveryAck(senderId, data.id);
+            notifyAndroid('ENCRYPTED_MESSAGE', {
+              senderId: senderId,
+              id: data.id,
+              iv: data.iv,
+              ciphertext: data.ciphertext,
+              timestamp: data.timestamp,
+              replyToId: data.replyToId,
+              isRoomBroadcast: !!data.isRoomBroadcast,
+              roomId: data.roomId || null
+            });
+            break;
+
+          case 'TYPING_STATUS':
+            notifyAndroid('TYPING_STATUS', { senderId: senderId, isTyping: !!data.isTyping });
+            break;
+
+          case 'READ_RECEIPT':
+            notifyAndroid('READ_RECEIPT', { senderId: senderId, messageId: data.messageId, timestamp: data.timestamp });
+            break;
+
+          case 'MESSAGE_REACTION':
+            notifyAndroid('MESSAGE_REACTION', { senderId: senderId, messageId: data.messageId, emoji: data.emoji });
+            break;
+
+          case 'VOICE_NOTE':
+            notifyAndroid('VOICE_NOTE', {
+              senderId: senderId,
+              id: data.id,
+              base64Audio: data.base64Audio,
+              durationMs: data.durationMs,
+              timestamp: data.timestamp
+            });
+            break;
+
+          case 'FILE_OFFER':
+            notifyAndroid('FILE_OFFER', {
+              senderId: senderId,
+              transferId: data.transferId,
+              fileName: data.fileName,
+              fileSize: data.fileSize,
+              mimeType: data.mimeType,
+              totalChunks: data.totalChunks,
+              sha256: data.sha256
+            });
+            break;
+
+          case 'FILE_ACCEPT':
+            notifyAndroid('FILE_ACCEPT', { senderId: senderId, transferId: data.transferId });
+            break;
+
+          case 'FILE_DECLINE':
+            notifyAndroid('FILE_DECLINE', { senderId: senderId, transferId: data.transferId, reason: data.reason });
+            break;
+
+          case 'FILE_CHUNK':
+            notifyAndroid('FILE_CHUNK', {
+              senderId: senderId,
+              transferId: data.transferId,
+              chunkIndex: data.chunkIndex,
+              totalChunks: data.totalChunks,
+              base64Data: data.data
+            });
+            break;
+
+          case 'FILE_COMPLETE':
+            notifyAndroid('FILE_COMPLETE', { senderId: senderId, transferId: data.transferId });
+            break;
+
+          case 'PING':
+            // Reply with Pong
+            const conn = activeConnections[senderId];
+            if (conn && conn.open) {
+              conn.send({ type: 'PONG', sendTime: data.sendTime });
+            }
+            break;
+
+          case 'PONG':
+            const now = Date.now();
+            const rtt = Math.max(1, now - (data.sendTime || now));
+            notifyAndroid('PING_RESULT', { targetId: senderId, rttMs: rtt });
+            break;
+
+          case 'DELIVERY_ACK':
+            notifyAndroid('DELIVERY_ACK', { senderId: senderId, messageId: data.messageId });
+            break;
+        }
+      }
+
+      function sendDeliveryAck(targetId, messageId) {
+        const conn = activeConnections[targetId];
+        if (conn && conn.open) {
+          conn.send({ type: 'DELIVERY_ACK', messageId: messageId });
+        }
+      }
+
+      function startPing(peerId) {
+        stopPing(peerId);
+        pingIntervals[peerId] = setInterval(() => {
+          window.peerEngine.measurePing(peerId);
+        }, 6000);
+      }
+
+      function stopPing(peerId) {
+        if (pingIntervals[peerId]) {
+          clearInterval(pingIntervals[peerId]);
+          delete pingIntervals[peerId];
+        }
+      }
+
+      function showVideoContainer(isVideo) {
+        const container = document.getElementById('videoContainer');
+        const localVideo = document.getElementById('localVideo');
+        container.style.display = 'block';
+        localVideo.style.display = isVideo ? 'block' : 'none';
+      }
+
+      function hideVideoContainer() {
+        const container = document.getElementById('videoContainer');
+        container.style.display = 'none';
+        const remoteVideo = document.getElementById('remoteVideo');
+        const localVideo = document.getElementById('localVideo');
+        if (remoteVideo.srcObject) remoteVideo.srcObject = null;
+        if (localVideo.srcObject) localVideo.srcObject = null;
+      }
+
+    })();
+  </script>
+</body>
+</html>

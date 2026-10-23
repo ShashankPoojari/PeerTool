@@ -1,0 +1,6 @@
+{
+  "name": "Peer Tool",
+  "description": "Peer Tool - Decentralized P2P Messenger & File Transfer utility featuring end-to-end encrypted messaging (ECDH P-256 + AES-256-GCM), high-speed chunked binary sharing, mesh rooms, and audio/video calling.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
